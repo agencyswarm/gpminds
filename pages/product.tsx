@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, FormEvent } from "react";
-import { useAuth, Protect, PricingTable, UserButton } from "@clerk/nextjs";
+import { useEffect, useState, FormEvent } from "react";
+import { useAuth, useUser, Protect, PricingTable, UserButton } from "@clerk/nextjs";
 import DatePicker from "react-datepicker";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -30,17 +30,14 @@ function downloadTxt(filename: string, text: string) {
 // ------------------------------------------------------
 function normalizeMarkdown(raw: string): string {
   if (!raw) return "";
-
   let t = raw.replace(/\r\n/g, "\n");
   t = t.replace(/\s*\[DONE\]\s*$/i, "").trim();
 
-  // force headings to own line
   t = t
     .replace(/ *### +Summary of visit for the doctor's records */gi, "\n### Summary of visit for the doctor's records\n")
     .replace(/ *### +Next steps for the doctor */gi, "\n### Next steps for the doctor\n")
     .replace(/ *### +Draft of email to patient in patient-friendly language */gi, "\n### Draft of email to patient in patient-friendly language\n");
 
-  // fields
   const FIELD_LABELS = [
     "Patient name",
     "Date of visit",
@@ -58,63 +55,25 @@ function normalizeMarkdown(raw: string): string {
     t = t.replace(reField, `\n**${label}:**`);
   }
 
-  // --------------------------------------------------
-  // EMAIL-SPECIFIC FIXES
-  // --------------------------------------------------
-
-  // 1) "To: <Patient Email> Subject: ..." → 2 paragraphs
-  t = t.replace(
-    /To:\s*<Patient Email>[ \t]*Subject:/i,
-    "To: <Patient Email>\n\nSubject:"
-  );
-
-  // 1b) more generic: "To: XYZ Subject:" → 2 paragraphs
-  t = t.replace(
-    /(To:\s*[^\n]+?)\s+(Subject:)/gi,
-    "$1\n\n$2"
-  );
-
-  // 2) "Subject: ...Dear Ethan," → give Dear its own paragraph
-  // also handles: "Subject: ... 2025-11-01Dear Ethan,"
-  t = t.replace(
-    /(Subject:[^\n]*?)\s*(Dear\s+[A-Za-z][^\n]*,?)/i,
-    "$1\n\n$2"
-  );
-
-  // 3) "Dear Ethan,Thank you..." → 2 newlines after greeting
-  // make it broad on purpose
-  t = t.replace(
-    /(Dear\s+[A-Za-z][^,\n]*,)\s*(?=\S)/gi,
-    "$1\n\n"
-  );
-
-  // 4) closing gets stuck
+  // EMAIL FIXES
+  t = t.replace(/To:\s*<Patient Email>[ \t]*Subject:/i, "To: <Patient Email>\n\nSubject:");
+  t = t.replace(/(To:\s*[^\n]+?)\s+(Subject:)/gi, "$1\n\n$2");
+  t = t.replace(/(Subject:[^\n]*?)\s*(Dear\s+[A-Za-z][^\n]*,?)/i, "$1\n\n$2");
+  t = t.replace(/(Dear\s+[A-Za-z][^,\n]*,)\s*(?=\S)/gi, "$1\n\n");
   t = t.replace(/(\.)(\s*Warm regards,)/gi, "$1\n\n$2");
 
-  // --------------------------------------------------
-  // NEXT STEPS: ensure 1./2./3. are on separate lines ONLY in that block
-  // --------------------------------------------------
+  // NEXT STEPS block only
   t = t.replace(
     /(### Next steps for the doctor[\s\S]*?)(?=### Draft of email to patient in patient-friendly language|$)/,
     (block) => {
-      const withListLines = block
-        .replace(/(\d+\.\s)/g, "\n$1")
-        .replace(/\n{3,}/g, "\n\n");
+      const withListLines = block.replace(/(\d+\.\s)/g, "\n$1").replace(/\n{3,}/g, "\n\n");
       return withListLines.trimEnd() + "\n";
     }
   );
 
-  // --------------------------------------------------
-  // general "numbered list at start of line" tidy
-  // --------------------------------------------------
   t = t.replace(/^(\d+)\.\s*/gm, "\n$1. ");
-
-  // kill trailing ---
   t = t.replace(/---\s*$/gm, "");
-
-  // clean big gaps
   t = t.replace(/\n{3,}/g, "\n\n");
-
   return t.trim();
 }
 
@@ -160,14 +119,11 @@ function parseEmailSection(
   const toMatch =
     s.match(/\*\*To:\*\*\s*<?([^>\n]+)>?/i) ||
     s.match(/To:\s*<?([^>\n]+)>?/i);
-  if (toMatch) {
-    to = toMatch[1].trim();
-  }
+  if (toMatch) to = toMatch[1].trim();
 
-  // SUBJECT
+  // SUBJECT + BODY
   let subject = "";
   let body = "";
-
   const subjMatch =
     s.match(/\*\*Subject:\*\*\s*([^\n]+)/i) ||
     s.match(/Subject:\s*([^\n]+)/i);
@@ -177,27 +133,20 @@ function parseEmailSection(
     const afterSubjectStart = s.indexOf(subjMatch[0]) + subjMatch[0].length;
     let afterSubject = s.slice(afterSubjectStart).trim();
 
-    // if Dear got glued to subject, rip it
+    // rip "Dear ..." off subject if glued
     let dearFromSubject = "";
     const dearIdx = subjLine.search(/\bDear\s+[A-Za-z]/i);
     if (dearIdx !== -1) {
       dearFromSubject = subjLine.slice(dearIdx).trim();
       subjLine = subjLine.slice(0, dearIdx).trim();
     }
-
     subject = subjLine;
 
-    if (dearFromSubject) {
-      body = dearFromSubject + (afterSubject ? "\n\n" + afterSubject : "");
-    } else {
-      body = afterSubject;
-    }
+    body = dearFromSubject ? dearFromSubject + (afterSubject ? "\n\n" + afterSubject : "") : afterSubject;
   } else {
-    // no subject → everything except To: is body
     body = s.replace(/To:\s*.+?(?:\n|$)/i, "").trim();
   }
 
-  // if no Dear at top but we know name, add it
   if (!/Dear\s+/i.test(body) && patientName) {
     body = `Dear ${patientName},\n\n${body}`;
   }
@@ -231,9 +180,7 @@ function extractDoctorTasks(nextStepsBlock: string) {
   const tasks: string[] = [];
   for (const line of lines) {
     const m = line.match(/^\s*(\d+)\.\s*(.+)$/);
-    if (m) {
-      tasks.push(m[2].trim());
-    }
+    if (m) tasks.push(m[2].trim());
   }
   return tasks;
 }
@@ -243,6 +190,7 @@ function extractDoctorTasks(nextStepsBlock: string) {
 // ------------------------------------------------------
 function ConsultationForm() {
   const { getToken } = useAuth();
+  const { user } = useUser();
 
   const [patientName, setPatientName] = useState("");
   const [visitDate, setVisitDate] = useState<Date | null>(new Date());
@@ -263,10 +211,16 @@ function ConsultationForm() {
   const [doctorTasks, setDoctorTasks] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<"email" | "summary" | "automations">("email");
 
-  const [toOverride, setToOverride] = useState("");
-  const [autoEmail, setAutoEmail] = useState(false);
-  const [autoEHR, setAutoEHR] = useState(false);
-  const [autoTask, setAutoTask] = useState(false);
+  // --- Email connections / credentials (MVP) ---
+  const [myEmail, setMyEmail] = useState("");
+  const [showEmailSettings, setShowEmailSettings] = useState(false);
+  const [sendLoading, setSendLoading] = useState<"self" | "patient" | null>(null);
+
+  useEffect(() => {
+    // Prefill clinician email from Clerk if available
+    const primary = user?.primaryEmailAddress?.emailAddress || "";
+    setMyEmail((prev) => prev || primary);
+  }, [user]);
 
   function consumeFinalText(finalText: string) {
     const normalized = normalizeMarkdown(finalText);
@@ -290,7 +244,6 @@ function ConsultationForm() {
     e.preventDefault();
     setOutput("");
     setLoading(true);
-    setToOverride("");
 
     const jwt = await getToken();
     if (!jwt) {
@@ -325,9 +278,7 @@ function ConsultationForm() {
         buffer += ev.data;
       },
       onclose() {
-        if (buffer) {
-          consumeFinalText(buffer);
-        }
+        if (buffer) consumeFinalText(buffer);
         setLoading(false);
       },
       onerror(err) {
@@ -338,7 +289,71 @@ function ConsultationForm() {
     });
   }
 
-  const finalTo = toOverride || parsedEmail.to;
+  // --- SEND EMAIL (MVP via server SMTP relay) ---
+  async function sendEmail(toAddress: string) {
+    const jwt = await getToken();
+    if (!jwt) {
+      alert("Authentication required.");
+      return;
+    }
+    if (!toAddress) {
+      alert("Missing recipient address.");
+      return;
+    }
+    if (!parsedEmail.subject || !parsedEmail.body) {
+      alert("Subject and body are required.");
+      return;
+    }
+
+    const payload = {
+      to: toAddress,
+      subject: parsedEmail.subject,
+      body: parsedEmail.body,
+      // Optional hints for server (From name/email). Server can ignore/override.
+      from_name: user?.fullName || "Clinician",
+      from_email: myEmail || user?.primaryEmailAddress?.emailAddress || "",
+    };
+
+    const res = await fetch("/email/send", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${jwt}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(msg || "Failed to send email.");
+    }
+  }
+
+  // Buttons that wrap sendEmail with UI state
+  async function handleSend(to: "self" | "patient") {
+    try {
+      setSendLoading(to);
+      if (to === "self") {
+        await sendEmail(myEmail);
+        alert("Draft emailed to you.");
+      } else {
+        const dest = parsedEmail.to?.trim();
+        if (!dest) {
+          alert("No patient email found. Add it in the Email tab first.");
+          return;
+        }
+        await sendEmail(dest);
+        alert("Email sent to patient.");
+      }
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || "Email send failed.");
+    } finally {
+      setSendLoading(null);
+    }
+  }
+
+  const finalTo = parsedEmail.to?.trim();
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800">
@@ -431,13 +446,24 @@ function ConsultationForm() {
               />
             </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-3 px-6 rounded-lg transition-colors duration-200"
-            >
-              {loading ? "Generating Summary..." : "Generate Summary"}
-            </button>
+            <div className="flex items-center justify-between">
+              <button
+                type="submit"
+                disabled={loading}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-3 px-6 rounded-lg transition-colors duration-200"
+              >
+                {loading ? "Generating Summary..." : "Generate Summary"}
+              </button>
+
+              {/* Email connections quick access */}
+              <button
+                type="button"
+                onClick={() => setShowEmailSettings(true)}
+                className="text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+              >
+                Email Connections
+              </button>
+            </div>
           </form>
 
           {/* rendered markdown */}
@@ -521,20 +547,28 @@ function ConsultationForm() {
             {/* tab bodies */}
             <div className="p-5 flex-1 overflow-auto">
               {activeTab === "email" && (
-                <div className="space-y-3">
-                  <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Parsed email</h2>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Parsed email</h2>
+                    <button
+                      onClick={() => setShowEmailSettings(true)}
+                      className="text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                    >
+                      Connections
+                    </button>
+                  </div>
 
-                  {!parsedEmail.hasEmail && !toOverride && (
+                  {!parsedEmail.hasEmail && (
                     <p className="text-xs text-amber-500 bg-amber-500/10 px-3 py-2 rounded-lg">
                       No patient email detected. Add one below.
                     </p>
                   )}
 
                   <div className="space-y-2">
-                    <label className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">TO</label>
+                    <label className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">TO (Patient)</label>
                     <input
-                      value={finalTo}
-                      onChange={(e) => setToOverride(e.target.value)}
+                      value={finalTo || ""}
+                      onChange={(e) => setParsedEmail((o) => ({ ...o, to: e.target.value }))}
                       placeholder="<Patient Email>"
                       className="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-sm"
                     />
@@ -555,36 +589,31 @@ function ConsultationForm() {
                     <textarea
                       value={parsedEmail.body}
                       onChange={(e) => setParsedEmail((old) => ({ ...old, body: e.target.value }))}
-                      rows={6}
+                      rows={8}
                       className="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-sm"
                     />
                   </div>
 
-                  <div className="flex gap-2">
+                  {/* Send Actions */}
+                  <div className="flex flex-col gap-2">
                     <button
-                      onClick={() => navigator.clipboard.writeText(parsedEmail.subject || "")}
-                      className="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 text-xs"
+                      onClick={() => handleSend("patient")}
+                      disabled={!finalTo || sendLoading !== null}
+                      className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-2 px-4 rounded-lg"
                     >
-                      Copy subject
+                      {sendLoading === "patient" ? "Sending to Patient..." : "Send to Patient"}
                     </button>
                     <button
-                      onClick={() => navigator.clipboard.writeText(parsedEmail.body || "")}
-                      className="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 text-xs"
+                      onClick={() => handleSend("self")}
+                      disabled={!myEmail || sendLoading !== null}
+                      className="w-full bg-gray-800 hover:bg-gray-900 disabled:bg-gray-600 text-white font-semibold py-2 px-4 rounded-lg"
                     >
-                      Copy body
+                      {sendLoading === "self" ? "Sending to You..." : `Send to Me (${myEmail || "set email first"})`}
                     </button>
-                    <button
-                      onClick={() =>
-                        navigator.clipboard.writeText(
-                          `To: ${finalTo || "<Patient Email>"}\nSubject: ${parsedEmail.subject || ""}\n\n${
-                            parsedEmail.body || ""
-                          }`
-                        )
-                      }
-                      className="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 text-xs"
-                    >
-                      Copy full email
-                    </button>
+
+                    <div className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
+                      Emails are sent via the server SMTP relay (configurable). Gmail/Outlook OAuth coming soon.
+                    </div>
                   </div>
                 </div>
               )}
@@ -620,22 +649,22 @@ function ConsultationForm() {
                 <div className="space-y-4">
                   <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Automations</h2>
                   <p className="text-xs text-gray-500 dark:text-gray-400">
-                    These are UI-only toggles for now. We can wire them to backend/webhooks next.
+                    UI toggles for future wiring.
                   </p>
 
                   <label className="flex items-center justify-between bg-gray-100 dark:bg-gray-700/40 px-3 py-2 rounded-lg">
                     <span className="text-sm text-gray-700 dark:text-gray-200">Email this to patient</span>
-                    <input type="checkbox" checked={autoEmail} onChange={(e) => setAutoEmail(e.target.checked)} />
+                    <input type="checkbox" />
                   </label>
 
                   <label className="flex items-center justify-between bg-gray-100 dark:bg-gray-700/40 px-3 py-2 rounded-lg">
                     <span className="text-sm text-gray-700 dark:text-gray-200">Send to EHR webhook</span>
-                    <input type="checkbox" checked={autoEHR} onChange={(e) => setAutoEHR(e.target.checked)} />
+                    <input type="checkbox" />
                   </label>
 
                   <label className="flex items-center justify-between bg-gray-100 dark:bg-gray-700/40 px-3 py-2 rounded-lg">
                     <span className="text-sm text-gray-700 dark:text-gray-200">Create follow-up task</span>
-                    <input type="checkbox" checked={autoTask} onChange={(e) => setAutoTask(e.target.checked)} />
+                    <input type="checkbox" />
                   </label>
                 </div>
               )}
@@ -643,6 +672,76 @@ function ConsultationForm() {
           </div>
         </div>
       </main>
+
+      {/* Email Connections Modal (MVP) */}
+      {showEmailSettings && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+          <div className="w-full max-w-lg bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Email Credentials & Connections</h3>
+              <button
+                className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                onClick={() => setShowEmailSettings(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
+                  Your email (used for “Send to Me”)
+                </label>
+                <input
+                  value={myEmail}
+                  onChange={(e) => setMyEmail(e.target.value)}
+                  placeholder="you@clinic.example"
+                  className="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-sm"
+                />
+                <p className="text-[11px] text-gray-500 mt-1">
+                  Prefilled from your Clerk account where possible.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  disabled
+                  className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300"
+                  title="Coming soon"
+                >
+                  Connect Gmail (OAuth)
+                </button>
+                <button
+                  disabled
+                  className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300"
+                  title="Coming soon"
+                >
+                  Connect Outlook (OAuth)
+                </button>
+              </div>
+
+              <div className="rounded-lg bg-gray-50 dark:bg-gray-900/40 p-3 text-xs text-gray-600 dark:text-gray-300">
+                <p className="mb-2 font-semibold">How sending works (MVP)</p>
+                <ol className="list-decimal pl-5 space-y-1">
+                  <li>Server sends via configured SMTP relay (see <code>.env</code>).</li>
+                  <li>“Send to Patient” uses the TO field above.</li>
+                  <li>“Send to Me” uses your saved email here.</li>
+                </ol>
+                <p className="mt-2">Gmail/Outlook OAuth are scaffolded for a seamless “send-as-you” flow next.</p>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-sm"
+                  onClick={() => setShowEmailSettings(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
